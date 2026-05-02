@@ -2,7 +2,6 @@
 .env
 .env.*
 !.env.example
-.python-version
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
