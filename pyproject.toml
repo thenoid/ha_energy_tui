@@ -1,0 +1,61 @@
+[project]
+name = "ha-energy-tui"
+version = "0.1.0"
+description = "A Textual TUI for configuring Home Assistant Energy dashboard devices over the websocket API."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+authors = [
+  { name = "Rocky Olsen" },
+]
+keywords = [
+  "home-assistant",
+  "energy",
+  "textual",
+  "tui",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Framework :: AsyncIO",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Home Automation",
+  "Topic :: Utilities",
+]
+dependencies = [
+  "aiohttp>=3.13",
+  "textual>=0.89",
+]
+
+[project.urls]
+Homepage = "https://github.com/rockyolsen/ha-energy-tui"
+Issues = "https://github.com/rockyolsen/ha-energy-tui/issues"
+Source = "https://github.com/rockyolsen/ha-energy-tui"
+
+[project.scripts]
+ha-energy-tui = "ha_energy_tui.app:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
