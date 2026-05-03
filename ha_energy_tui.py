@@ -1052,6 +1052,14 @@ class EnergyConfiguratorApp(App[None]):
         layout: vertical;
     }
 
+    #autosave-indicator {
+        dock: right;
+        width: auto;
+        height: 1;
+        padding: 0 1;
+        color: $text;
+    }
+
     #filter {
         width: 1fr;
     }
@@ -1153,6 +1161,7 @@ class EnergyConfiguratorApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.query_one(Header).mount(Static("", id="autosave-indicator"))
         table = self.table
         table.cursor_type = "cell"
         table.zebra_stripes = True
@@ -1180,6 +1189,10 @@ class EnergyConfiguratorApp(App[None]):
     @property
     def dirty_indicator(self) -> Static:
         return self.query_one("#dirty-indicator", Static)
+
+    @property
+    def autosave_indicator(self) -> Static:
+        return self.query_one("#autosave-indicator", Static)
 
     @property
     def visual_widget(self) -> EnergyTree:
@@ -1276,10 +1289,13 @@ class EnergyConfiguratorApp(App[None]):
 
     def status_text(self) -> Text:
         text = Text(self.status)
-        if self.autosave:
-            start = self.status.find("Autosave")
-            if start >= 0:
-                text.stylize("bold", start, start + len("Autosave"))
+        start = self.status.find("Autosave")
+        if start >= 0:
+            end = start + len("Autosave")
+            if self.autosave:
+                text.stylize("bold green", start, end)
+            else:
+                text.stylize("dim", start, end)
         return text
 
     def refresh_table(self) -> None:
@@ -1406,6 +1422,7 @@ class EnergyConfiguratorApp(App[None]):
         if isinstance(self.screen, (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt)):
             return
         self.autosave = not self.autosave
+        self.autosave_indicator.update("Autosave" if self.autosave else "")
         self.status = f"{self.mode_status_prefix()} | Autosave {'enabled' if self.autosave else 'disabled'}."
         if self.autosave and self.dirty_modes:
             self.schedule_autosave()
