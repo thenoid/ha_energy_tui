@@ -17,7 +17,9 @@ import os
 import sys
 import threading
 from dataclasses import dataclass
-from typing import Any, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
@@ -299,6 +301,7 @@ CLEAR_PARENT = "__clear_parent__"
 CANCEL_PARENT = "__cancel_parent__"
 VISUAL_ROOT = "__visual_root__"
 MISSING_PARENTS = "__missing_parents__"
+AUDIT_LOG_PATH = Path("tui_ha.log")
 
 
 class EnergyTree(Tree[str]):
@@ -329,10 +332,14 @@ def next_mode(mode: str) -> str:
     return MODE_ORDER[(index + 1) % len(MODE_ORDER)]
 
 
+def prefs_data(prefs: dict[str, Any]) -> dict[str, Any]:
+    return prefs.get("data", prefs)
+
+
 def load_energy_sensors(
     states: list[dict[str, Any]], prefs: dict[str, Any], mode: str
 ) -> list[EnergySensor]:
-    data = prefs.get("data", prefs)
+    data = prefs_data(prefs)
     config = mode_config(mode)
     configured = {
         item.get("stat_consumption")
@@ -369,7 +376,7 @@ def load_energy_sensors(
 
 
 def load_device_configs(prefs: dict[str, Any], mode: str) -> dict[str, dict[str, Any]]:
-    data = prefs.get("data", prefs)
+    data = prefs_data(prefs)
     return {
         item["stat_consumption"]: dict(item)
         for item in data.get(mode_config(mode)["pref_key"], [])
@@ -388,28 +395,50 @@ def count_device_config_changes(
     )
 
 
-def load_entity_registry(client: HAClient) -> dict[str, dict[str, Any]]:
+def device_config_changes(
+    saved_configs: dict[str, dict[str, Any]],
+    staged_configs: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    return {
+        entity_id: {
+            "old": saved_configs.get(entity_id),
+            "new": staged_configs.get(entity_id),
+        }
+        for entity_id in sorted(set(saved_configs) | set(staged_configs))
+        if saved_configs.get(entity_id) != staged_configs.get(entity_id)
+    }
+
+
+def audit_log_line(action: str, **fields: Any) -> str:
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    details = " ".join(
+        f"{key}={json.dumps(value, sort_keys=True)}" for key, value in fields.items()
+    )
+    return f"{timestamp} {action}{' ' + details if details else ''}\n"
+
+
+def write_audit_log(action: str, **fields: Any) -> None:
     try:
-        entries = client.command_with_reconnect("config/entity_registry/list")
+        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(audit_log_line(action, **fields))
+    except OSError:
+        pass
+
+
+def _load_registry(client: HAClient, command: str, key: str) -> dict[str, dict[str, Any]]:
+    try:
+        entries = client.command_with_reconnect(command)
     except Exception:
         return {}
-    return {
-        entry["entity_id"]: entry
-        for entry in entries
-        if entry.get("entity_id")
-    }
+    return {entry[key]: entry for entry in entries if entry.get(key)}
+
+
+def load_entity_registry(client: HAClient) -> dict[str, dict[str, Any]]:
+    return _load_registry(client, "config/entity_registry/list", "entity_id")
 
 
 def load_device_registry(client: HAClient) -> dict[str, dict[str, Any]]:
-    try:
-        devices = client.command_with_reconnect("config/device_registry/list")
-    except Exception:
-        return {}
-    return {
-        device["id"]: device
-        for device in devices
-        if device.get("id")
-    }
+    return _load_registry(client, "config/device_registry/list", "id")
 
 
 def save_device_consumption(
@@ -418,7 +447,7 @@ def save_device_consumption(
     device_configs: dict[str, dict[str, Any]],
     mode: str,
 ) -> Any:
-    data = prefs.get("data", prefs)
+    data = prefs_data(prefs)
     new_consumption = [device_configs[entity_id] for entity_id in sorted(device_configs)]
     payload = dict(data)
     payload[mode_config(mode)["pref_key"]] = new_consumption
@@ -548,7 +577,11 @@ def filter_sensors(
     if not query:
         return sensors
     needle = query.lower()
-    sensors_by_id = {sensor.entity_id: sensor for sensor in sensors}
+    sensors_by_id = (
+        {sensor.entity_id: sensor for sensor in sensors}
+        if (include_entity_name or include_parent)
+        else {}
+    )
     matches: list[EnergySensor] = []
     for sensor in sensors:
         config = device_configs.get(sensor.entity_id, {})
@@ -908,7 +941,7 @@ class DirtyQuit(ModalScreen[str]):
         self.dismiss("cancel")
 
 
-class TextPrompt(ModalScreen[Optional[str]]):
+class TextPrompt(ModalScreen[str | None]):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("ctrl+c", "cancel", "Cancel"),
@@ -956,7 +989,7 @@ class TextPrompt(ModalScreen[Optional[str]]):
         self.dismiss(None)
 
 
-class RenamePrompt(ModalScreen[Optional[RenameValues]]):
+class RenamePrompt(ModalScreen[RenameValues | None]):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("ctrl+c", "cancel", "Cancel"),
@@ -1174,6 +1207,20 @@ class EnergyConfiguratorApp(App[None]):
         self.refresh_table()
         table.focus()
 
+    def _modal_active(self) -> bool:
+        return isinstance(
+            self.screen,
+            (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt),
+        )
+
+    @property
+    def _save_hint(self) -> str:
+        return "Autosaving." if self.autosave else "Press s to save."
+
+    def _ensure_configured(self, entity_id: str) -> None:
+        if entity_id not in self.device_configs:
+            self.device_configs[entity_id] = {"stat_consumption": entity_id}
+
     @property
     def table(self) -> DataTable:
         return self.query_one("#table", EnergyTable)
@@ -1219,12 +1266,13 @@ class EnergyConfiguratorApp(App[None]):
     @on(TabbedContent.TabActivated)
     def tab_activated(self, event: TabbedContent.TabActivated) -> None:
         if event.pane.id == "visual-tab":
+            self.refresh_visual()
             self.visual_widget.focus()
         elif event.pane.id == "config":
             self.table.focus()
 
     def switch_tab(self, direction: int) -> None:
-        if isinstance(self.screen, (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt)):
+        if self._modal_active():
             return
         tabs = ["config", "visual-tab"]
         tabbed_content = self.query_one(TabbedContent)
@@ -1238,7 +1286,7 @@ class EnergyConfiguratorApp(App[None]):
         self.switch_tab(1)
 
     def action_quit(self) -> None:
-        if isinstance(self.screen, (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt)):
+        if self._modal_active():
             return
         if self.has_unsaved_changes():
             self.push_screen(DirtyQuit(), self.handle_dirty_quit)
@@ -1358,7 +1406,8 @@ class EnergyConfiguratorApp(App[None]):
         self.status_widget.update(self.status_text())
         self.filter_feedback.update(self.filter_feedback_text())
         self.dirty_indicator.display = self.has_unsaved_changes()
-        self.refresh_visual()
+        if self.query_one(TabbedContent).active == "visual-tab":
+            self.refresh_visual()
 
     def sort_value(
         self,
@@ -1419,7 +1468,7 @@ class EnergyConfiguratorApp(App[None]):
         self.save_mode(mode, show_notice=False)
 
     def action_toggle_autosave(self) -> None:
-        if isinstance(self.screen, (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt)):
+        if self._modal_active():
             return
         self.autosave = not self.autosave
         self.autosave_indicator.update("Autosave" if self.autosave else "")
@@ -1506,14 +1555,14 @@ class EnergyConfiguratorApp(App[None]):
         self.query_one("#filter", Input).focus()
 
     def action_cycle_filter_scope(self) -> None:
-        if isinstance(self.screen, (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt)):
+        if self._modal_active():
             return
         self.filter_scope_index = (self.filter_scope_index + 1) % len(FILTER_SCOPES)
         self.status = f"{self.mode_status_prefix()} | Filter scope changed."
         self.refresh_table()
 
     def action_sort_selected_column(self) -> None:
-        if isinstance(self.screen, (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt)):
+        if self._modal_active():
             return
         if self.query_one(TabbedContent).active == "visual-tab":
             return
@@ -1526,15 +1575,16 @@ class EnergyConfiguratorApp(App[None]):
             self.sort_column_key = column_key
             self.sort_desc = False
         table.clear(columns=True)
-        table.add_columns(*self.table_columns())
+        columns = self.table_columns()
+        table.add_columns(*columns)
         direction = "desc" if self.sort_desc else "asc"
-        column_label = self.table_columns()[column_index][0].rsplit(" ", 1)[0]
+        column_label = columns[column_index][0].rsplit(" ", 1)[0]
         self.status = f"{self.mode_status_prefix()} | Sorted by {column_label} {direction}."
         self.refresh_table()
         self.table.move_cursor(column=column_index)
 
     def action_toggle_parentless_filter(self) -> None:
-        if isinstance(self.screen, (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt)):
+        if self._modal_active():
             return
         self.parentless_only = not self.parentless_only
         self.status = (
@@ -1544,7 +1594,7 @@ class EnergyConfiguratorApp(App[None]):
         self.refresh_table()
 
     def action_switch_mode(self) -> None:
-        if isinstance(self.screen, (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt)):
+        if self._modal_active():
             return
         self.mode = next_mode(self.mode)
         self.sensors = load_energy_sensors(
@@ -1579,7 +1629,7 @@ class EnergyConfiguratorApp(App[None]):
         self.show_device_info(entity_id)
 
     def action_toggle_device(self) -> None:
-        if isinstance(self.screen, (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt)):
+        if self._modal_active():
             return
         if self.query_one(TabbedContent).active == "visual-tab":
             node = self.visual_widget.cursor_node
@@ -1590,13 +1640,29 @@ class EnergyConfiguratorApp(App[None]):
         if not entity_id:
             return
         if entity_id in self.device_configs:
+            previous_config = dict(self.device_configs[entity_id])
             del self.device_configs[entity_id]
+            write_audit_log(
+                "staged_disable_device",
+                mode=self.mode,
+                entity_id=entity_id,
+                old=previous_config,
+                new=None,
+            )
         else:
-            self.device_configs[entity_id] = {"stat_consumption": entity_id}
+            new_config = {"stat_consumption": entity_id}
+            self.device_configs[entity_id] = new_config
+            write_audit_log(
+                "staged_enable_device",
+                mode=self.mode,
+                entity_id=entity_id,
+                old=None,
+                new=new_config,
+            )
         self.mark_dirty()
         self.status = (
             f"{self.mode_status_prefix()} | Staged {len(self.device_configs)} device consumption sensors. "
-            f"{'Autosaving.' if self.autosave else 'Press s to save.'}"
+            f"{self._save_hint}"
         )
         self.refresh_table()
 
@@ -1604,7 +1670,7 @@ class EnergyConfiguratorApp(App[None]):
         if isinstance(self.screen, (DeviceInfo, Notice)):
             self.screen.dismiss()
             return
-        if isinstance(self.screen, (ParentPicker, TextPrompt, RenamePrompt, ConfirmRefresh, DirtyQuit)):
+        if self._modal_active():
             return
         if self.query_one(TabbedContent).active == "visual-tab":
             entity_id = self.visual_widget.cursor_node.data
@@ -1739,8 +1805,7 @@ class EnergyConfiguratorApp(App[None]):
         entity_id = self.selected_entity_id()
         if not entity_id:
             return
-        if entity_id not in self.device_configs:
-            self.device_configs[entity_id] = {"stat_consumption": entity_id}
+        self._ensure_configured(entity_id)
         sensors_by_id = {sensor.entity_id: sensor for sensor in self.sensors}
         choices = [ParentChoice("<none>", None)]
         choices.extend(
@@ -1766,8 +1831,7 @@ class EnergyConfiguratorApp(App[None]):
         entity_id = self.selected_entity_id()
         if not entity_id:
             return
-        if entity_id not in self.device_configs:
-            self.device_configs[entity_id] = {"stat_consumption": entity_id}
+        self._ensure_configured(entity_id)
         sensors_by_id = {sensor.entity_id: sensor for sensor in self.sensors}
         energy_name = self.device_configs[entity_id].get("name", "")
         entity_name = self.entity_name_updates.get(
@@ -1787,6 +1851,7 @@ class EnergyConfiguratorApp(App[None]):
 
         energy_name = value.energy_name.strip()
         entity_name = value.entity_name.strip()
+        previous_config = dict(self.device_configs[entity_id])
         if energy_name:
             self.device_configs[entity_id]["name"] = energy_name
         else:
@@ -1806,25 +1871,50 @@ class EnergyConfiguratorApp(App[None]):
         else:
             self.entity_name_updates[entity_id] = entity_name or None
 
+        write_audit_log(
+            "staged_rename_device",
+            mode=self.mode,
+            entity_id=entity_id,
+            old_config=previous_config,
+            new_config=dict(self.device_configs[entity_id]),
+            old_entity_name=current_custom_entity_name or current_display_entity_name,
+            new_entity_name=entity_name or None,
+        )
         self.mark_dirty()
-        self.status = f"Renamed {entity_id}. {'Autosaving.' if self.autosave else 'Press s to save.'}"
+        self.status = f"Renamed {entity_id}. {self._save_hint}"
         self.refresh_table()
 
     def set_parent(self, entity_id: str, parent: str) -> None:
         if parent == CANCEL_PARENT:
             self.status = "Parent selection cancelled."
         elif parent == CLEAR_PARENT:
+            previous_parent = self.device_configs[entity_id].get("included_in_stat")
             self.device_configs[entity_id].pop("included_in_stat", None)
+            write_audit_log(
+                "staged_clear_parent",
+                mode=self.mode,
+                entity_id=entity_id,
+                old_parent=previous_parent,
+                new_parent=None,
+            )
             self.mark_dirty()
-            self.status = f"Cleared parent for {entity_id}. {'Autosaving.' if self.autosave else 'Press s to save.'}"
+            self.status = f"Cleared parent for {entity_id}. {self._save_hint}"
         else:
+            previous_parent = self.device_configs[entity_id].get("included_in_stat")
             self.device_configs[entity_id]["included_in_stat"] = parent
+            write_audit_log(
+                "staged_set_parent",
+                mode=self.mode,
+                entity_id=entity_id,
+                old_parent=previous_parent,
+                new_parent=parent,
+            )
             self.mark_dirty()
-            self.status = f"Set parent for {entity_id}. {'Autosaving.' if self.autosave else 'Press s to save.'}"
+            self.status = f"Set parent for {entity_id}. {self._save_hint}"
         self.refresh_table()
 
     def action_refresh(self) -> None:
-        if isinstance(self.screen, (DeviceInfo, Notice, ConfirmRefresh, DirtyQuit, ParentPicker, TextPrompt, RenamePrompt)):
+        if self._modal_active():
             return
         if self.dirty_modes or self.entity_name_updates:
             self.push_screen(ConfirmRefresh(), self.confirm_refresh)
@@ -1877,12 +1967,12 @@ class EnergyConfiguratorApp(App[None]):
         self.saving = True
         saved_configs = load_device_configs(self.prefs, mode)
         staged_configs = self.device_configs_by_mode[mode]
-        change_count = count_device_config_changes(saved_configs, staged_configs) + len(
-            self.entity_name_updates
-        )
+        config_changes = device_config_changes(saved_configs, staged_configs)
+        entity_name_changes = dict(sorted(self.entity_name_updates.items()))
+        change_count = len(config_changes) + len(entity_name_changes)
         change_word = "change" if change_count == 1 else "changes"
         try:
-            for entity_id, name in self.entity_name_updates.items():
+            for entity_id, name in entity_name_changes.items():
                 self.client.command_with_reconnect(
                     "config/entity_registry/update",
                     entity_id=entity_id,
@@ -1909,10 +1999,25 @@ class EnergyConfiguratorApp(App[None]):
                 f"{change_count} {change_word}; "
                 f"{len(self.device_configs_by_mode[mode])} configured."
             )
+            write_audit_log(
+                "saved_changes",
+                mode=mode,
+                autosave=not show_notice,
+                config_changes=config_changes,
+                entity_name_changes=entity_name_changes,
+            )
             notice = self.status
         except Exception as err:  # noqa: BLE001 - show errors in status line
             self.dirty_modes.add(mode)
             self.status = f"{'Autosave' if not show_notice else 'Save'} failed: {err}"
+            write_audit_log(
+                "save_failed",
+                mode=mode,
+                autosave=not show_notice,
+                error=str(err),
+                config_changes=config_changes,
+                entity_name_changes=entity_name_changes,
+            )
             notice = self.status
         finally:
             self.saving = False
@@ -1967,7 +2072,7 @@ def main() -> int:
     with HAClient(args.server, args.token, verify_ssl=args.verify_ssl) as client:
         if args.prefs_summary:
             prefs = client.command_with_reconnect("energy/get_prefs")
-            data = prefs.get("data", prefs)
+            data = prefs_data(prefs)
             print(
                 json.dumps(
                     {
