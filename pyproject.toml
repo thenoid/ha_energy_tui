@@ -37,18 +37,11 @@ Homepage = "https://github.com/rockyolsen/ha-energy-tui"
 Issues = "https://github.com/rockyolsen/ha-energy-tui/issues"
 Source = "https://github.com/rockyolsen/ha-energy-tui"
 
-[project.scripts]
-ha-energy-tui = "ha_energy_tui.app:main"
-
 [dependency-groups]
 dev = [
   "pytest>=8.0",
   "ruff>=0.8",
 ]
-
-[build-system]
-requires = ["hatchling>=1.26"]
-build-backend = "hatchling.build"
 
 [tool.ruff]
 line-length = 140

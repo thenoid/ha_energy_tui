@@ -29,21 +29,15 @@ painful to maintain. It works, but expect rough edges and keep backups.
 - Column selection and ascending/descending sorting.
 - Uses `aiohttp` websocket client with heartbeat support.
 
-## Install
+## Run
 
 With `uv`:
-
-```bash
-uv tool install git+https://github.com/rockyolsen/ha-energy-tui
-```
-
-For local development:
 
 ```bash
 git clone https://github.com/rockyolsen/ha-energy-tui
 cd ha-energy-tui
 uv sync
-uv run ha-energy-tui --help
+uv run ha_energy_tui.py --help
 ```
 
 ## Home Assistant Setup
@@ -65,15 +59,15 @@ Pass `--verify-ssl` if you want certificate verification enabled.
 ## Usage
 
 ```bash
-uv run ha-energy-tui
+uv run ha_energy_tui.py
 ```
 
 Useful options:
 
 ```bash
-ha-energy-tui --list
-ha-energy-tui --prefs-summary
-ha-energy-tui --server https://homeassistant.local:8123 --token "$HASS_TOKEN"
+uv run ha_energy_tui.py --list
+uv run ha_energy_tui.py --prefs-summary
+uv run ha_energy_tui.py --server https://homeassistant.local:8123 --token "$HASS_TOKEN"
 ```
 
 ## Key Bindings
@@ -112,14 +106,10 @@ ha-energy-tui --server https://homeassistant.local:8123 --token "$HASS_TOKEN"
 uv sync --all-extras
 uv run pytest
 uv run ruff check .
-uv run ha-energy-tui --help
+uv run ha_energy_tui.py --help
 ```
 
-The package uses a standard `src/` layout. The CLI entry point is:
-
-```text
-ha-energy-tui = ha_energy_tui.app:main
-```
+The app is a single executable Python script: `ha_energy_tui.py`.
 
 ## Contributing
 

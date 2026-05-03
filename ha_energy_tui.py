@@ -5,7 +5,7 @@ Uses only the Home Assistant websocket API. No direct .storage edits.
 Auth:
   export HASS_SERVER=https://ha.example:8123
   export HASS_TOKEN=...
-  uv run ha-energy-tui
+  uv run ha_energy_tui.py
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 import aiohttp
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -571,6 +572,12 @@ def filter_sensors(
     return matches
 
 
+def join_words(words: list[str]) -> str:
+    if len(words) <= 2:
+        return " and ".join(words)
+    return f"{', '.join(words[:-1])}, and {words[-1]}"
+
+
 class EnergyTable(DataTable):
     BINDINGS = [
         Binding("enter", "app.show_info", "Info"),
@@ -1046,7 +1053,22 @@ class EnergyConfiguratorApp(App[None]):
     }
 
     #filter {
+        width: 1fr;
+    }
+
+    #filter-bar {
         dock: top;
+        height: 3;
+    }
+
+    #filter-feedback {
+        width: auto;
+        min-width: 26;
+        height: 3;
+        content-align: right middle;
+        padding: 0 1;
+        background: $panel;
+        color: $text-muted;
     }
 
     #table {
@@ -1058,15 +1080,6 @@ class EnergyConfiguratorApp(App[None]):
         min-height: 1;
         padding: 0 1;
         background: $panel;
-    }
-
-    #autosave-indicator {
-        dock: bottom;
-        min-height: 1;
-        padding: 0 1;
-        background: $success;
-        color: $text;
-        text-style: bold;
     }
 
     #dirty-indicator {
@@ -1129,11 +1142,12 @@ class EnergyConfiguratorApp(App[None]):
         yield Header()
         with TabbedContent(initial="config"):
             with TabPane("Configure", id="config"):
-                yield Input(placeholder="Filter sensors by name or entity id", id="filter")
+                with Horizontal(id="filter-bar"):
+                    yield Input(placeholder="Filter sensors by name or entity id", id="filter")
+                    yield Static(id="filter-feedback")
                 yield EnergyTable(id="table")
             with TabPane("Visual", id="visual-tab"):
                 yield EnergyTree("Configured Energy Devices", id="visual")
-        yield Static("AUTOSAVE ON", id="autosave-indicator")
         yield Static("UNSAVED CHANGES", id="dirty-indicator")
         yield Static(id="status")
         yield Footer()
@@ -1143,7 +1157,6 @@ class EnergyConfiguratorApp(App[None]):
         table.cursor_type = "cell"
         table.zebra_stripes = True
         table.add_columns(*self.table_columns())
-        self.autosave_indicator.display = self.autosave
         self.dirty_indicator.display = self.has_unsaved_changes()
         self.status = (
             f"{self.mode_status_prefix()} | Loaded {len(self.sensors)} sensors; "
@@ -1161,8 +1174,8 @@ class EnergyConfiguratorApp(App[None]):
         return self.query_one("#status", Static)
 
     @property
-    def autosave_indicator(self) -> Static:
-        return self.query_one("#autosave-indicator", Static)
+    def filter_feedback(self) -> Static:
+        return self.query_one("#filter-feedback", Static)
 
     @property
     def dirty_indicator(self) -> Static:
@@ -1251,6 +1264,24 @@ class EnergyConfiguratorApp(App[None]):
     def filter_scope(self) -> dict[str, Any]:
         return FILTER_SCOPES[self.filter_scope_index]
 
+    def filter_feedback_text(self) -> str:
+        filters = ["id/name"]
+        if self.filter_scope["entity_name"]:
+            filters.append("HA entity name")
+        if self.filter_scope["parent"]:
+            filters.append("parent")
+        if self.parentless_only:
+            filters.append("parentless only")
+        return f"Filtering on {join_words(filters)}"
+
+    def status_text(self) -> Text:
+        text = Text(self.status)
+        if self.autosave:
+            start = self.status.find("Autosave")
+            if start >= 0:
+                text.stylize("bold", start, start + len("Autosave"))
+        return text
+
     def refresh_table(self) -> None:
         table = self.table
         current_entity = self.current_entity_id()
@@ -1308,8 +1339,8 @@ class EnergyConfiguratorApp(App[None]):
                     break
         else:
             table.move_cursor(column=current_column)
-        self.status_widget.update(self.status)
-        self.autosave_indicator.display = self.autosave
+        self.status_widget.update(self.status_text())
+        self.filter_feedback.update(self.filter_feedback_text())
         self.dirty_indicator.display = self.has_unsaved_changes()
         self.refresh_visual()
 
