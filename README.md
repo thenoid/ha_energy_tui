@@ -76,6 +76,8 @@ uv run ha_energy_tui.py --server https://homeassistant.local:8123 --token "$HASS
 | --- | --- |
 | `q` | Quit, prompting if there are unsaved changes |
 | `s` | Save staged changes |
+| `ctrl+z` | Undo last edit |
+| `ctrl+y` / `ctrl+shift+z` | Redo last undone edit |
 | `a` | Toggle autosave |
 | `r` | Refresh from Home Assistant, prompting if dirty |
 | `v` | Run Home Assistant energy validation |
