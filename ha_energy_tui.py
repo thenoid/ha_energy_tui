@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import threading
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -297,6 +298,18 @@ class RenameValues:
     entity_name: str
 
 
+@dataclass
+class EditCommand:
+    action: str
+    mode: str
+    entity_id: str
+    old_config: dict[str, Any] | None
+    new_config: dict[str, Any] | None
+    entity_name_changed: bool = False
+    old_entity_name: str | None = None
+    new_entity_name: str | None = None
+
+
 CLEAR_PARENT = "__clear_parent__"
 CANCEL_PARENT = "__cancel_parent__"
 VISUAL_ROOT = "__visual_root__"
@@ -382,6 +395,17 @@ def load_device_configs(prefs: dict[str, Any], mode: str) -> dict[str, dict[str,
         for item in data.get(mode_config(mode)["pref_key"], [])
         if item.get("stat_consumption")
     }
+
+
+def clone_config(config: dict[str, Any] | None) -> dict[str, Any] | None:
+    return deepcopy(config) if config is not None else None
+
+
+def command_has_changes(command: EditCommand) -> bool:
+    return command.old_config != command.new_config or (
+        command.entity_name_changed
+        and command.old_entity_name != command.new_entity_name
+    )
 
 
 def count_device_config_changes(
@@ -1068,6 +1092,9 @@ class EnergyConfiguratorApp(App[None]):
         Binding("m", "switch_mode", "Mode"),
         Binding("a", "toggle_autosave", "Autosave"),
         Binding("s", "save", "Save"),
+        Binding("ctrl+z", "undo", "Undo"),
+        Binding("ctrl+y", "redo", "Redo"),
+        Binding("ctrl+shift+z", "redo", "Redo", show=False),
         Binding("v", "validate", "Validate"),
         Binding("r", "refresh", "Refresh"),
         Binding("i", "show_info", "Info"),
@@ -1159,6 +1186,8 @@ class EnergyConfiguratorApp(App[None]):
             for configured_mode in MODE_ORDER
         }
         self.entity_name_updates: dict[str, str | None] = {}
+        self.undo_stack: list[EditCommand] = []
+        self.redo_stack: list[EditCommand] = []
         self.dirty_modes: set[str] = set()
         self.autosave = False
         self.autosave_timer: Any = None
@@ -1450,6 +1479,87 @@ class EnergyConfiguratorApp(App[None]):
             f"{dirty} | Filter: {self.filter_scope['label']}{suffix}"
         )
 
+    @property
+    def _change_hint(self) -> str:
+        return self._save_hint if self.has_unsaved_changes() else "No unsaved changes."
+
+    def desired_entity_name(self, entity_id: str) -> str | None:
+        if entity_id in self.entity_name_updates:
+            return self.entity_name_updates[entity_id]
+        return self.entity_registry.get(entity_id, {}).get("name") or None
+
+    def entity_name_from_input(self, entity_id: str, entity_name: str) -> str | None:
+        current_custom_name = self.entity_registry.get(entity_id, {}).get("name") or None
+        current_display_name = entity_registry_name(
+            entity_id,
+            {sensor.entity_id: sensor for sensor in self.sensors},
+            self.entity_registry,
+        )
+        if entity_name == (current_custom_name or ""):
+            return current_custom_name
+        if current_custom_name is None and entity_name == current_display_name:
+            return None
+        return entity_name or None
+
+    def set_desired_entity_name(self, entity_id: str, desired_name: str | None) -> None:
+        current_custom_name = self.entity_registry.get(entity_id, {}).get("name") or None
+        if desired_name == current_custom_name:
+            self.entity_name_updates.pop(entity_id, None)
+        else:
+            self.entity_name_updates[entity_id] = desired_name
+
+    def sync_dirty_mode(self, mode: str) -> None:
+        saved_configs = load_device_configs(self.prefs, mode)
+        staged_configs = self.device_configs_by_mode[mode]
+        if count_device_config_changes(saved_configs, staged_configs) or self.entity_name_updates:
+            self.dirty_modes.add(mode)
+        else:
+            self.dirty_modes.discard(mode)
+
+    def set_device_config(self, mode: str, entity_id: str, config: dict[str, Any] | None) -> None:
+        if config is None:
+            self.device_configs_by_mode[mode].pop(entity_id, None)
+        else:
+            self.device_configs_by_mode[mode][entity_id] = clone_config(config) or {}
+
+    def apply_edit_command(self, command: EditCommand, *, use_new: bool) -> None:
+        config = command.new_config if use_new else command.old_config
+        self.set_device_config(command.mode, command.entity_id, config)
+        if command.entity_name_changed:
+            entity_name = command.new_entity_name if use_new else command.old_entity_name
+            self.set_desired_entity_name(command.entity_id, entity_name)
+        self.sync_dirty_mode(command.mode)
+        if self.autosave and self.has_unsaved_changes():
+            self.schedule_autosave()
+
+    def stage_edit_command(self, command: EditCommand) -> bool:
+        if not command_has_changes(command):
+            return False
+        self.apply_edit_command(command, use_new=True)
+        self.undo_stack.append(command)
+        self.redo_stack.clear()
+        return True
+
+    def undo_edit_command(self) -> EditCommand | None:
+        if not self.undo_stack:
+            return None
+        command = self.undo_stack.pop()
+        self.apply_edit_command(command, use_new=False)
+        self.redo_stack.append(command)
+        return command
+
+    def redo_edit_command(self) -> EditCommand | None:
+        if not self.redo_stack:
+            return None
+        command = self.redo_stack.pop()
+        self.apply_edit_command(command, use_new=True)
+        self.undo_stack.append(command)
+        return command
+
+    def history_label(self, command: EditCommand) -> str:
+        action = command.action.removeprefix("staged_").replace("_", " ")
+        return f"{action} for {command.entity_id}"
+
     def mark_dirty(self, mode: str | None = None) -> None:
         dirty_mode = mode or self.mode
         self.dirty_modes.add(dirty_mode)
@@ -1475,6 +1585,52 @@ class EnergyConfiguratorApp(App[None]):
         self.status = f"{self.mode_status_prefix()} | Autosave {'enabled' if self.autosave else 'disabled'}."
         if self.autosave and self.dirty_modes:
             self.schedule_autosave()
+        self.refresh_table()
+
+    def action_undo(self) -> None:
+        if self._modal_active():
+            return
+        command = self.undo_edit_command()
+        if command is None:
+            self.status = f"{self.mode_status_prefix()} | Nothing to undo."
+        else:
+            write_audit_log(
+                "undo_edit",
+                mode=command.mode,
+                entity_id=command.entity_id,
+                action=command.action,
+                old_config=command.old_config,
+                new_config=command.new_config,
+                old_entity_name=command.old_entity_name,
+                new_entity_name=command.new_entity_name,
+            )
+            self.status = (
+                f"{self.mode_status_prefix()} | Undid {self.history_label(command)}. "
+                f"{self._change_hint}"
+            )
+        self.refresh_table()
+
+    def action_redo(self) -> None:
+        if self._modal_active():
+            return
+        command = self.redo_edit_command()
+        if command is None:
+            self.status = f"{self.mode_status_prefix()} | Nothing to redo."
+        else:
+            write_audit_log(
+                "redo_edit",
+                mode=command.mode,
+                entity_id=command.entity_id,
+                action=command.action,
+                old_config=command.old_config,
+                new_config=command.new_config,
+                old_entity_name=command.old_entity_name,
+                new_entity_name=command.new_entity_name,
+            )
+            self.status = (
+                f"{self.mode_status_prefix()} | Redid {self.history_label(command)}. "
+                f"{self._change_hint}"
+            )
         self.refresh_table()
 
     def refresh_visual(self) -> None:
@@ -1640,29 +1796,34 @@ class EnergyConfiguratorApp(App[None]):
         if not entity_id:
             return
         if entity_id in self.device_configs:
-            previous_config = dict(self.device_configs[entity_id])
-            del self.device_configs[entity_id]
-            write_audit_log(
-                "staged_disable_device",
+            previous_config = clone_config(self.device_configs[entity_id])
+            command = EditCommand(
+                action="staged_disable_device",
                 mode=self.mode,
                 entity_id=entity_id,
-                old=previous_config,
-                new=None,
+                old_config=previous_config,
+                new_config=None,
             )
         else:
             new_config = {"stat_consumption": entity_id}
-            self.device_configs[entity_id] = new_config
-            write_audit_log(
-                "staged_enable_device",
+            command = EditCommand(
+                action="staged_enable_device",
                 mode=self.mode,
                 entity_id=entity_id,
-                old=None,
-                new=new_config,
+                old_config=None,
+                new_config=new_config,
             )
-        self.mark_dirty()
+        self.stage_edit_command(command)
+        write_audit_log(
+            command.action,
+            mode=command.mode,
+            entity_id=command.entity_id,
+            old=command.old_config,
+            new=command.new_config,
+        )
         self.status = (
             f"{self.mode_status_prefix()} | Staged {len(self.device_configs)} device consumption sensors. "
-            f"{self._save_hint}"
+            f"{self._change_hint}"
         )
         self.refresh_table()
 
@@ -1805,7 +1966,6 @@ class EnergyConfiguratorApp(App[None]):
         entity_id = self.selected_entity_id()
         if not entity_id:
             return
-        self._ensure_configured(entity_id)
         sensors_by_id = {sensor.entity_id: sensor for sensor in self.sensors}
         choices = [ParentChoice("<none>", None)]
         choices.extend(
@@ -1821,7 +1981,7 @@ class EnergyConfiguratorApp(App[None]):
             )
             if parent_entity != entity_id
         )
-        current_parent = self.device_configs[entity_id].get("included_in_stat")
+        current_parent = self.device_configs.get(entity_id, {}).get("included_in_stat")
         self.push_screen(
             ParentPicker(choices, current_parent=current_parent),
             lambda parent: self.set_parent(entity_id, parent),
@@ -1831,9 +1991,9 @@ class EnergyConfiguratorApp(App[None]):
         entity_id = self.selected_entity_id()
         if not entity_id:
             return
-        self._ensure_configured(entity_id)
         sensors_by_id = {sensor.entity_id: sensor for sensor in self.sensors}
-        energy_name = self.device_configs[entity_id].get("name", "")
+        current_config = self.device_configs.get(entity_id, {})
+        energy_name = current_config.get("name", "")
         entity_name = self.entity_name_updates.get(
             entity_id,
             entity_registry_name(entity_id, sensors_by_id, self.entity_registry),
@@ -1851,66 +2011,97 @@ class EnergyConfiguratorApp(App[None]):
 
         energy_name = value.energy_name.strip()
         entity_name = value.entity_name.strip()
-        previous_config = dict(self.device_configs[entity_id])
-        if energy_name:
-            self.device_configs[entity_id]["name"] = energy_name
-        else:
-            self.device_configs[entity_id].pop("name", None)
+        previous_config = clone_config(self.device_configs.get(entity_id))
+        new_config = clone_config(previous_config)
+        entity_name_changed = (
+            self.entity_name_from_input(entity_id, entity_name)
+            != self.desired_entity_name(entity_id)
+        )
+        if new_config is None and (energy_name or entity_name_changed):
+            new_config = {"stat_consumption": entity_id}
+        if new_config is not None and energy_name:
+            new_config["name"] = energy_name
+        elif new_config is not None:
+            new_config.pop("name", None)
 
-        registry_entry = self.entity_registry.get(entity_id, {})
-        current_custom_entity_name = registry_entry.get("name") or ""
-        current_display_entity_name = entity_registry_name(
+        old_entity_name = self.desired_entity_name(entity_id)
+        new_entity_name = self.entity_name_from_input(entity_id, entity_name)
+        command = EditCommand(
+            action="staged_rename_device",
+            mode=self.mode,
+            entity_id=entity_id,
+            old_config=previous_config,
+            new_config=new_config,
+            entity_name_changed=True,
+            old_entity_name=old_entity_name,
+            new_entity_name=new_entity_name,
+        )
+        if not self.stage_edit_command(command):
+            self.status = "Rename unchanged."
+            self.refresh_table()
+            return
+
+        old_display_name = old_entity_name or entity_registry_name(
             entity_id,
             {sensor.entity_id: sensor for sensor in self.sensors},
             self.entity_registry,
         )
-        if entity_name == current_custom_entity_name or (
-            not current_custom_entity_name and entity_name == current_display_entity_name
-        ):
-            self.entity_name_updates.pop(entity_id, None)
-        else:
-            self.entity_name_updates[entity_id] = entity_name or None
+        new_display_name = new_entity_name or sensor_label(
+            entity_id,
+            {sensor.entity_id: sensor for sensor in self.sensors},
+        )
 
         write_audit_log(
-            "staged_rename_device",
-            mode=self.mode,
+            command.action,
+            mode=command.mode,
             entity_id=entity_id,
             old_config=previous_config,
-            new_config=dict(self.device_configs[entity_id]),
-            old_entity_name=current_custom_entity_name or current_display_entity_name,
-            new_entity_name=entity_name or None,
+            new_config=new_config,
+            old_entity_name=old_display_name,
+            new_entity_name=new_display_name,
         )
-        self.mark_dirty()
-        self.status = f"Renamed {entity_id}. {self._save_hint}"
+        self.status = f"Renamed {entity_id}. {self._change_hint}"
         self.refresh_table()
 
     def set_parent(self, entity_id: str, parent: str) -> None:
         if parent == CANCEL_PARENT:
             self.status = "Parent selection cancelled."
-        elif parent == CLEAR_PARENT:
-            previous_parent = self.device_configs[entity_id].get("included_in_stat")
-            self.device_configs[entity_id].pop("included_in_stat", None)
-            write_audit_log(
-                "staged_clear_parent",
-                mode=self.mode,
-                entity_id=entity_id,
-                old_parent=previous_parent,
-                new_parent=None,
-            )
-            self.mark_dirty()
-            self.status = f"Cleared parent for {entity_id}. {self._save_hint}"
         else:
-            previous_parent = self.device_configs[entity_id].get("included_in_stat")
-            self.device_configs[entity_id]["included_in_stat"] = parent
-            write_audit_log(
-                "staged_set_parent",
+            previous_config = clone_config(self.device_configs.get(entity_id))
+            new_config = clone_config(previous_config)
+            if new_config is None and parent != CLEAR_PARENT:
+                new_config = {"stat_consumption": entity_id}
+            previous_parent = previous_config.get("included_in_stat") if previous_config else None
+            if new_config is not None and parent == CLEAR_PARENT:
+                new_config.pop("included_in_stat", None)
+                action = "staged_clear_parent"
+                status = f"Cleared parent for {entity_id}. "
+            elif new_config is not None:
+                new_config["included_in_stat"] = parent
+                action = "staged_set_parent"
+                status = f"Set parent for {entity_id}. "
+            else:
+                action = "staged_clear_parent"
+                status = f"Parent unchanged for {entity_id}. "
+            command = EditCommand(
+                action=action,
                 mode=self.mode,
                 entity_id=entity_id,
-                old_parent=previous_parent,
-                new_parent=parent,
+                old_config=previous_config,
+                new_config=new_config,
             )
-            self.mark_dirty()
-            self.status = f"Set parent for {entity_id}. {self._save_hint}"
+            if self.stage_edit_command(command):
+                new_parent = new_config.get("included_in_stat") if new_config else None
+                write_audit_log(
+                    command.action,
+                    mode=command.mode,
+                    entity_id=command.entity_id,
+                    old_parent=previous_parent,
+                    new_parent=new_parent,
+                )
+                self.status = f"{status}{self._change_hint}"
+            else:
+                self.status = f"Parent unchanged for {entity_id}."
         self.refresh_table()
 
     def action_refresh(self) -> None:
@@ -1942,6 +2133,8 @@ class EnergyConfiguratorApp(App[None]):
             }
             self.entity_name_updates.clear()
             self.dirty_modes.clear()
+            self.undo_stack.clear()
+            self.redo_stack.clear()
             self.status = (
                 f"{self.mode_status_prefix()} | Reloaded {len(self.sensors)} sensors; "
                 f"{len(self.device_configs)} configured."
